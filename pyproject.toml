@@ -58,7 +58,6 @@ include = [
     "pyproject.toml",
 ]
 
-["playstealth_actions", "playstealth_cli.py"]
 
 [tool.ruff]
 line-length = 120
