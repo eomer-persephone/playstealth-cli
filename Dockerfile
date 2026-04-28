@@ -30,5 +30,5 @@ RUN mkdir -p /app/data && \
 USER pwuser
 
 # Entrypoint
-ENTRYPOINT ["playstealth"]
-CMD ["--help"]
+# ENTRYPOINT not yet configured; use: docker run playstealth:ci python -m playstealth_cli --help
+CMD ["python", "-m", "playstealth_cli", "--help"]
