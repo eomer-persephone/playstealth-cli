@@ -24,6 +24,7 @@ dist/
 tests/
 pytest.ini
 *.md
+!README.md
 docs/
 
 # Secrets & local state
