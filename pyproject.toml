@@ -44,11 +44,44 @@ Documentation = "https://github.com/SIN-CLIs/playstealth-cli#readme"
 Issues = "https://github.com/SIN-CLIs/playstealth-cli/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["playstealth_actions", "playstealth_cli.py"]
+packages = ["playstealth_actions"]
+include = ["playstealth_cli.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "playstealth_actions",
+    "playstealth_cli.py",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "COMPLIANCE.md",
+    "pyproject.toml",
+]
+
+["playstealth_actions", "playstealth_cli.py"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "RUF"]
+ignore = [
+    "S101",   # asserts are fine in tests
+    "S603",   # subprocess without shell=True is the safe form
+    "S607",   # partial paths are fine for our use
+    "B008",   # function-call defaults are intentional in places
+    "UP007",  # we still target 3.10 for `Optional[...]`
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B017"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
 
 [tool.mypy]
 python_version = "3.10"
