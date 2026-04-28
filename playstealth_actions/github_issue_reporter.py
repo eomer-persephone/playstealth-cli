@@ -139,6 +139,13 @@ class GitHubIssueReporter:
             return "selector_update"
         return "bug_report"
 
+    # Body section markers used by the test suite & docs.
+    # Keep these stable -- downstream tooling greps for them.
+    _ERROR_MSG_HEADER = "### Error Message"
+    _TRACEBACK_HEADER = "### Traceback"
+    _MAX_ERROR_CHARS = 2000
+    _MAX_TRACEBACK_CHARS = 3000
+
     def _format_body(
         self,
         template: str,
@@ -147,31 +154,79 @@ class GitHubIssueReporter:
         tb: str,
         sid: str,
         critical: bool,
+        severity: str = "high",
     ) -> str:
+        truncated_error = error_msg[: self._MAX_ERROR_CHARS]
+        truncated_tb = tb[: self._MAX_TRACEBACK_CHARS]
         base = (
-            f"### Module: `{module_name}`\n"
-            f"**Error:** `{error_msg}`\n"
-            f"**Session:** `{sid}`\n"
-            f"**Critical:** `{'Yes' if critical else 'No'}`\n"
-            f"**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`\n\n"
-            "### Traceback\n"
-            "```python\n"
-            f"{tb[:1200]}\n"
-            "```\n"
+            f"### Module: `{module_name}`
+"
+            f"**Severity:** `{severity}`
+"
+            f"**Session:** `{sid}`
+"
+            f"**Critical:** `{'Yes' if critical else 'No'}`
+"
+            f"**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`
+
+"
+            f"{self._ERROR_MSG_HEADER}
+"
+            "```
+"
+            f"{truncated_error}
+"
+            "```
+
+"
+            f"{self._TRACEBACK_HEADER}
+"
+            "```python
+"
+            f"{truncated_tb}
+"
+            "```
+"
         )
         if template == "selector_update":
             return base + (
-                "\n### Selector / DOM context\n"
-                "- [ ] Verify the target platform's DOM has not changed\n"
+                "
+### Selector / DOM context
+"
+                "- [ ] Verify the target platform's DOM has not changed
+"
                 "- [ ] Validate CSS / XPath / text heuristics with "
-                "`playstealth profile <url>`\n"
+                "`playstealth profile <url>`
+"
                 "- [ ] Adjust fallback selectors in `smart_selector.py` or "
-                "the relevant plugin\n"
+                "the relevant plugin
+"
                 "- [ ] Consider `playstealth queue blacklist-add` for a "
-                "persistent platform change\n\n"
+                "persistent platform change
+
+"
                 "> Auto-reported by the PlayStealth Resilience Engine. "
-                "Fallback applied. Telemetry logged.\n"
+                "Fallback applied. Telemetry logged.
+"
             )
+        return base + (
+            "
+### Bug context
+"
+            "- [ ] Check network / proxy state and Playwright binary version
+"
+            "- [ ] Validate `.env` secrets and GitHub App permissions
+"
+            "- [ ] Inspect `telemetry.jsonl` for preceding module failures
+"
+            "- [ ] On state / resume errors: clean `.playstealth_state/` "
+            "and restart
+
+"
+            "> Auto-reported by the PlayStealth Resilience Engine. "
+            "Fallback applied. Telemetry logged.
+"
+        )
         return base + (
             "\n### Bug context\n"
             "- [ ] Check network / proxy state and Playwright binary version\n"
@@ -210,16 +265,18 @@ class GitHubIssueReporter:
         self._reported_hashes.add(h)
 
         template = self._get_template_type(module_name, error_msg)
+        # Title contract: "🚨 <SEVERITY>: [<module>] <short-error>"
+        # The first segment is grepped by alerting tools; do not change.
+        short_err = error_msg.replace("\n", " ")[:80] or "<no error message>"
         title = (
-            f"[{module_name.split('.')[-1]}] "
-            f"{template.replace('_', ' ').title()}: {error_msg[:60]}"
+            f"🚨 {severity.upper()}: [{module_name}] {short_err}"
         )
         default_labels = [
             "bug",
-            "auto-reported",
+            "auto-generated",
+            f"severity:{severity}",
             module_name.split(".")[0],
             template,
-            f"severity:{severity}",
         ]
         if critical:
             default_labels.append("critical")
@@ -227,7 +284,13 @@ class GitHubIssueReporter:
             default_labels.extend(labels)
 
         body = self._format_body(
-            template, module_name, error_msg, traceback_str, session_id, critical
+            template,
+            module_name,
+            error_msg,
+            traceback_str,
+            session_id,
+            critical,
+            severity=severity,
         )
 
         try:
