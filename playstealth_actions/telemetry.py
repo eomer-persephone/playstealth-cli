@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+# Python 3.10 compatibility shim (datetime.UTC was added in 3.11).
+UTC = timezone.utc
 from pathlib import Path
 from typing import Any
 
