@@ -1,122 +1,266 @@
-"""GitHub Issue Reporter for PlayStealth CLI."""
+"""GitHub Issue Reporter for the PlayStealth Resilience Engine.
+
+Auto-files an issue against the GitHub App when a module fails. Supports both
+ways of supplying the app's private key:
+
+* ``GITHUB_APP_PRIVATE_KEY``      - PEM contents inline (preferred, secret-
+  manager friendly).
+* ``GITHUB_APP_PRIVATE_KEY_PATH`` - path to a PEM file on disk (legacy).
+
+Either ``GITHUB_INSTALLATION_ID`` or ``GITHUB_APP_INSTALLATION_ID`` is
+accepted for the installation id, again to remain backwards compatible with
+older deployments.
+"""
+from __future__ import annotations
+
+import hashlib
 import os
 import time
-import hashlib
-import jwt
-import httpx
-from pathlib import Path
-from typing import Optional, List
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional, Set
+
 
 class GitHubIssueReporter:
-    """Auto-report module failures to GitHub Issues via GitHub App."""
-    
-    def __init__(self):
-        self.app_id = os.getenv("GITHUB_APP_ID")
-        self.private_key_path = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
-        self.installation_id = os.getenv("GITHUB_APP_INSTALLATION_ID")
-        self.repo_owner = os.getenv("GITHUB_REPO_OWNER", "SIN-CLIs")
-        self.repo_name = os.getenv("GITHUB_REPO_NAME", "playstealth-cli")
-        self._token: Optional[str] = None
-        self._token_expires: float = 0
-        self._reported_hashes: set = set()
-        self._enabled = all([self.app_id, self.private_key_path, self.installation_id])
+    """Auto-report module failures to GitHub Issues via a GitHub App."""
 
+    def __init__(self) -> None:
+        self.app_id: Optional[str] = os.getenv("GITHUB_APP_ID")
+
+        # Private key: inline PEM wins, fall back to file path.
+        self._private_key: Optional[str] = os.getenv("GITHUB_APP_PRIVATE_KEY")
+        self.private_key_path: Optional[str] = os.getenv(
+            "GITHUB_APP_PRIVATE_KEY_PATH"
+        )
+
+        # Installation id: both env-var spellings are honoured.
+        self.installation_id: Optional[str] = os.getenv(
+            "GITHUB_INSTALLATION_ID"
+        ) or os.getenv("GITHUB_APP_INSTALLATION_ID")
+
+        self.repo_owner: str = os.getenv("GITHUB_REPO_OWNER", "SIN-CLIs")
+        self.repo_name: str = os.getenv("GITHUB_REPO_NAME", "playstealth-cli")
+
+        self._token: Optional[str] = None
+        self._token_expires: float = 0.0
+
+        # Public alias kept for the existing wrapper code.
+        self._reported_hashes: Set[str] = set()
+        # Alias used by the new test-suite.
+        self._issue_hashes: Set[str] = self._reported_hashes
+        self._token_cache: Optional[str] = None  # documented attribute
+
+        self._enabled: bool = bool(
+            self.app_id
+            and (self._private_key or self.private_key_path)
+            and self.installation_id
+        )
+
+    # ------------------------------------------------------------------
+    # Auth helpers
+    # ------------------------------------------------------------------
     def _load_private_key(self) -> str:
+        if self._private_key:
+            return self._private_key
         if not self.private_key_path:
-            raise ValueError("GITHUB_APP_PRIVATE_KEY_PATH not set")
+            raise ValueError(
+                "Neither GITHUB_APP_PRIVATE_KEY nor "
+                "GITHUB_APP_PRIVATE_KEY_PATH is set"
+            )
         return Path(self.private_key_path).read_text()
 
     def _generate_jwt(self) -> str:
+        # Imported lazily so test-suites and CLI commands that never report
+        # do not require the optional ``PyJWT[crypto]`` dependency.
+        import jwt  # type: ignore[import-untyped]
+
         now = int(time.time())
-        payload = {"iat": now - 60, "exp": now + 600, "iss": self.app_id}
+        payload = {"iat": now - 60, "exp": now + 540, "iss": self.app_id}
         return jwt.encode(payload, self._load_private_key(), algorithm="RS256")
 
-    async def _get_installation_token(self) -> str:
+    async def _get_installation_token(self) -> Optional[str]:
+        """Return a cached installation access token, refreshing as needed."""
         if self._token and time.time() < self._token_expires:
             return self._token
-        app_jwt = self._generate_jwt()
-        url = f"https://api.github.com/app/installations/{self.installation_id}/access_tokens"
-        async with httpx.AsyncClient(timeout=10) as client:
-            res = await client.post(url, headers={
-                "Authorization": f"Bearer {app_jwt}",
-                "Accept": "application/vnd.github.v3+json"
-            })
-            res.raise_for_status()
-            data = res.json()
-            self._token = data["token"]
-            self._token_expires = time.time() + 3000
-            return self._token
 
+        try:
+            import httpx  # local import keeps cold-start light
+
+            app_jwt = self._generate_jwt()
+            url = (
+                "https://api.github.com/app/installations/"
+                f"{self.installation_id}/access_tokens"
+            )
+            headers = {
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.post(url, headers=headers)
+                if res.status_code == 201:
+                    data = res.json()
+                    self._token = data["token"]
+                    # Tokens last 1h; refresh ~10 min early.
+                    self._token_expires = time.time() + 3000
+                    self._token_cache = self._token
+                    return self._token
+                # surface the failure for callers / logging
+                print(
+                    f"github_issue_reporter: token request failed "
+                    f"({res.status_code}): {res.text[:200]}"
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"github_issue_reporter: token fetch exception: {exc}")
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Body / dedup helpers
+    # ------------------------------------------------------------------
     def _dedup_hash(self, module: str, error: str) -> str:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return hashlib.sha256(f"{module}:{error}:{day}".encode()).hexdigest()[:12]
+        return hashlib.sha256(
+            f"{module}:{error}:{day}".encode()
+        ).hexdigest()[:12]
 
     def _get_template_type(self, module_name: str, error_msg: str) -> str:
         ctx = f"{module_name} {error_msg}".lower()
-        if any(kw in ctx for kw in ["selector", "dom", "scan", "click", "resolve", "locator", "timeout", "visible"]):
+        keywords = (
+            "selector",
+            "dom",
+            "scan",
+            "click",
+            "resolve",
+            "locator",
+            "timeout",
+            "visible",
+        )
+        if any(kw in ctx for kw in keywords):
             return "selector_update"
         return "bug_report"
 
-    def _format_body(self, template: str, module_name: str, error_msg: str, tb: str, sid: str, critical: bool) -> str:
-        base = f"""### 🔧 Module: `{module_name}`
-**Error:** `{error_msg}`
-**Session:** `{sid}`
-**Critical:** `{'Yes' if critical else 'No'}`
-**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`
-
-### 📜 Traceback
-```python
-{tb[:1200]}
-```
-"""
+    def _format_body(
+        self,
+        template: str,
+        module_name: str,
+        error_msg: str,
+        tb: str,
+        sid: str,
+        critical: bool,
+    ) -> str:
+        base = (
+            f"### Module: `{module_name}`\n"
+            f"**Error:** `{error_msg}`\n"
+            f"**Session:** `{sid}`\n"
+            f"**Critical:** `{'Yes' if critical else 'No'}`\n"
+            f"**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`\n\n"
+            "### Traceback\n"
+            "```python\n"
+            f"{tb[:1200]}\n"
+            "```\n"
+        )
         if template == "selector_update":
-            return base + """
-### 🎯 Selector/DOM Context
-- [ ] Prüfe, ob sich die DOM-Struktur der Zielplattform geändert hat
-- [ ] Validiere CSS/XPath/Text-Heuristiken mit `playstealth profile <url>`
-- [ ] Fallback-Selektoren in `smart_selector.py` oder Plugin anpassen
-- [ ] Ggf. `playstealth queue blacklist-add` bei persistenter Plattform-Änderung
+            return base + (
+                "\n### Selector / DOM context\n"
+                "- [ ] Verify the target platform's DOM has not changed\n"
+                "- [ ] Validate CSS / XPath / text heuristics with "
+                "`playstealth profile <url>`\n"
+                "- [ ] Adjust fallback selectors in `smart_selector.py` or "
+                "the relevant plugin\n"
+                "- [ ] Consider `playstealth queue blacklist-add` for a "
+                "persistent platform change\n\n"
+                "> Auto-reported by the PlayStealth Resilience Engine. "
+                "Fallback applied. Telemetry logged.\n"
+            )
+        return base + (
+            "\n### Bug context\n"
+            "- [ ] Check network / proxy state and Playwright binary version\n"
+            "- [ ] Validate `.env` secrets and GitHub App permissions\n"
+            "- [ ] Inspect `telemetry.jsonl` for preceding module failures\n"
+            "- [ ] On state / resume errors: clean `.playstealth_state/` "
+            "and restart\n\n"
+            "> Auto-reported by the PlayStealth Resilience Engine. "
+            "Fallback applied. Telemetry logged.\n"
+        )
 
-> Auto-reported by PlayStealth Resilience Engine. Fallback applied. Telemetry logged.
-"""
-        return base + """
-### 🐛 Bug Context
-- [ ] Prüfe Netzwerk/Proxy-State & Playwright-Binary-Version
-- [ ] Validiere `.env` Secrets & GitHub App Permissions
-- [ ] Prüfe `telemetry.jsonl` auf vorangehende Module-Failures
-- [ ] Bei State/Resume-Fehlern: `.playstealth_state/` bereinigen & neu starten
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    async def create_issue(
+        self,
+        module_name: str,
+        error_msg: str,
+        traceback_str: str,
+        session_id: str = "unknown",
+        critical: bool = False,
+        no_dedup: bool = False,
+        severity: str = "high",
+        labels: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Create a GitHub issue for a module failure.
 
-> Auto-reported by PlayStealth Resilience Engine. Fallback applied. Telemetry logged.
-"""
-
-    async def create_issue(self, module_name: str, error_msg: str, traceback_str: str, session_id: str, critical: bool = False, no_dedup: bool = False) -> Optional[str]:
+        Returns the new issue's ``html_url`` on success, otherwise ``None``.
+        """
         if not self._enabled:
             return None
-        
+
         h = self._dedup_hash(module_name, error_msg)
         if not no_dedup and h in self._reported_hashes:
             return None
         self._reported_hashes.add(h)
 
         template = self._get_template_type(module_name, error_msg)
-        title = f"🐛 [{module_name.split('.')[-1]}] {template.replace('_', ' ').title()}: {error_msg[:60]}"
-        labels = ["bug", "auto-reported", module_name.split(".")[0], template]
+        title = (
+            f"[{module_name.split('.')[-1]}] "
+            f"{template.replace('_', ' ').title()}: {error_msg[:60]}"
+        )
+        default_labels = [
+            "bug",
+            "auto-reported",
+            module_name.split(".")[0],
+            template,
+            f"severity:{severity}",
+        ]
         if critical:
-            labels.append("critical")
+            default_labels.append("critical")
+        if labels:
+            default_labels.extend(labels)
 
-        body = self._format_body(template, module_name, error_msg, traceback_str, session_id, critical)
-        
+        body = self._format_body(
+            template, module_name, error_msg, traceback_str, session_id, critical
+        )
+
         try:
+            import httpx
+
             token = await self._get_installation_token()
-            url = f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/issues"
-            async with httpx.AsyncClient(timeout=10) as client:
-                res = await client.post(url, json={"title": title, "body": body, "labels": labels}, headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github.v3+json"
-                })
-                res.raise_for_status()
-                return res.json().get("html_url")
-        except Exception as e:
-            print(f"⚠️ GitHub issue creation failed: {e}")
-            return None
+            if not token:
+                return None
+            url = (
+                f"https://api.github.com/repos/{self.repo_owner}/"
+                f"{self.repo_name}/issues"
+            )
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            async with httpx.AsyncClient(timeout=15) as client:
+                res = await client.post(
+                    url,
+                    json={
+                        "title": title,
+                        "body": body,
+                        "labels": default_labels,
+                    },
+                    headers=headers,
+                )
+                if res.status_code == 201:
+                    return res.json().get("html_url")
+                print(
+                    "github_issue_reporter: create_issue failed "
+                    f"({res.status_code}): {res.text[:200]}"
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"github_issue_reporter: create_issue exception: {exc}")
+
+        return None
