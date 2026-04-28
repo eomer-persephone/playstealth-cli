@@ -1,0 +1,93 @@
+name: Stealth benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_pass:
+        description: "Minimum passed count to consider this run successful"
+        default: "0"
+        required: false
+  schedule:
+    # Once a day at 03:17 UTC so we notice regressions in our stealth
+    # profile that are caused by upstream Chromium / Playwright bumps.
+    - cron: "17 3 * * *"
+  pull_request:
+    paths:
+      - "playstealth_actions/stealth_*.py"
+      - "playstealth_actions/human_*.py"
+      - "scripts/benchmark_stealth.py"
+      - ".github/workflows/stealth-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: SannySoft probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + Playwright
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-chromium-v1
+
+      - name: Install Playwright chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run SannySoft benchmark
+        id: bench
+        run: |
+          MIN_PASS="${{ github.event.inputs.min_pass || '0' }}"
+          # On scheduled runs we want a hard floor; on PRs we report only.
+          if [[ "${{ github.event_name }}" == "schedule" && "$MIN_PASS" == "0" ]]; then
+            MIN_PASS=15
+          fi
+          python scripts/benchmark_stealth.py --headless --min-pass "$MIN_PASS"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stealth-score-${{ github.run_id }}
+          path: stealth-score.json
+          if-no-files-found: error
+
+      - name: Comment summary on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('stealth-score.json')) return;
+            const r = JSON.parse(fs.readFileSync('stealth-score.json', 'utf8'));
+            const body = [
+              '### SannySoft stealth benchmark',
+              '',
+              '| metric | value |',
+              '|---|---:|',
+              `| passed | ${r.passed} / ${r.total} |`,
+              `| failed | ${r.failed} |`,
+              `| score  | ${r.score_percent}% |`,
+              '',
+              `Full report: download \`stealth-score-${context.runId}\` artifact.`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
