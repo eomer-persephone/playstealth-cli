@@ -24,6 +24,13 @@ from typing import List, Optional, Set
 class GitHubIssueReporter:
     """Auto-report module failures to GitHub Issues via a GitHub App."""
 
+    # Body section markers used by the test suite & docs.
+    # Keep these stable -- downstream tooling greps for them.
+    _ERROR_MSG_HEADER = "### Error Message"
+    _TRACEBACK_HEADER = "### Traceback"
+    _MAX_ERROR_CHARS = 2000
+    _MAX_TRACEBACK_CHARS = 3000
+
     def __init__(self) -> None:
         self.app_id: Optional[str] = os.getenv("GITHUB_APP_ID")
 
@@ -139,13 +146,6 @@ class GitHubIssueReporter:
             return "selector_update"
         return "bug_report"
 
-    # Body section markers used by the test suite & docs.
-    # Keep these stable -- downstream tooling greps for them.
-    _ERROR_MSG_HEADER = "### Error Message"
-    _TRACEBACK_HEADER = "### Traceback"
-    _MAX_ERROR_CHARS = 2000
-    _MAX_TRACEBACK_CHARS = 3000
-
     def _format_body(
         self,
         template: str,
@@ -158,75 +158,36 @@ class GitHubIssueReporter:
     ) -> str:
         truncated_error = error_msg[: self._MAX_ERROR_CHARS]
         truncated_tb = tb[: self._MAX_TRACEBACK_CHARS]
+        ts = datetime.now(timezone.utc).isoformat()
+        crit = "Yes" if critical else "No"
         base = (
-            f"### Module: `{module_name}`
-"
-            f"**Severity:** `{severity}`
-"
-            f"**Session:** `{sid}`
-"
-            f"**Critical:** `{'Yes' if critical else 'No'}`
-"
-            f"**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`
-
-"
-            f"{self._ERROR_MSG_HEADER}
-"
-            "```
-"
-            f"{truncated_error}
-"
-            "```
-
-"
-            f"{self._TRACEBACK_HEADER}
-"
-            "```python
-"
-            f"{truncated_tb}
-"
-            "```
-"
+            f"### Module: `{module_name}`\n"
+            f"**Severity:** `{severity}`\n"
+            f"**Session:** `{sid}`\n"
+            f"**Critical:** `{crit}`\n"
+            f"**Timestamp:** `{ts}Z`\n\n"
+            f"{self._ERROR_MSG_HEADER}\n"
+            "```\n"
+            f"{truncated_error}\n"
+            "```\n\n"
+            f"{self._TRACEBACK_HEADER}\n"
+            "```python\n"
+            f"{truncated_tb}\n"
+            "```\n"
         )
         if template == "selector_update":
             return base + (
-                "
-### Selector / DOM context
-"
-                "- [ ] Verify the target platform's DOM has not changed
-"
+                "\n### Selector / DOM context\n"
+                "- [ ] Verify the target platform's DOM has not changed\n"
                 "- [ ] Validate CSS / XPath / text heuristics with "
-                "`playstealth profile <url>`
-"
+                "`playstealth profile <url>`\n"
                 "- [ ] Adjust fallback selectors in `smart_selector.py` or "
-                "the relevant plugin
-"
+                "the relevant plugin\n"
                 "- [ ] Consider `playstealth queue blacklist-add` for a "
-                "persistent platform change
-
-"
+                "persistent platform change\n\n"
                 "> Auto-reported by the PlayStealth Resilience Engine. "
-                "Fallback applied. Telemetry logged.
-"
+                "Fallback applied. Telemetry logged.\n"
             )
-        return base + (
-            "
-### Bug context
-"
-            "- [ ] Check network / proxy state and Playwright binary version
-"
-            "- [ ] Validate `.env` secrets and GitHub App permissions
-"
-            "- [ ] Inspect `telemetry.jsonl` for preceding module failures
-"
-            "- [ ] On state / resume errors: clean `.playstealth_state/` "
-            "and restart
-
-"
-            "> Auto-reported by the PlayStealth Resilience Engine. "
-            "Fallback applied. Telemetry logged.
-"
-        )
         return base + (
             "\n### Bug context\n"
             "- [ ] Check network / proxy state and Playwright binary version\n"
@@ -265,12 +226,10 @@ class GitHubIssueReporter:
         self._reported_hashes.add(h)
 
         template = self._get_template_type(module_name, error_msg)
-        # Title contract: "🚨 <SEVERITY>: [<module>] <short-error>"
+        # Title contract: "<emoji> <SEVERITY>: [<module>] <short-error>"
         # The first segment is grepped by alerting tools; do not change.
         short_err = error_msg.replace("\n", " ")[:80] or "<no error message>"
-        title = (
-            f"🚨 {severity.upper()}: [{module_name}] {short_err}"
-        )
+        title = f"\U0001f6a8 {severity.upper()}: [{module_name}] {short_err}"
         default_labels = [
             "bug",
             "auto-generated",
