@@ -21,6 +21,19 @@ from pathlib import Path
 from typing import List, Optional, Set
 
 
+# Body section markers - kept as module-level constants so test fixtures and
+# downstream tooling can rely on them being stable.
+ERROR_SECTION = "### Error Message"
+TRACEBACK_SECTION = "### Traceback"
+META_SECTION = "### Context"
+
+# Hard caps applied to user-controlled strings before they're sent to GitHub.
+# GitHub itself caps issue bodies at 65536 chars, but keeping each section
+# bounded makes for readable issues and predictable dedup hashes.
+MAX_ERROR_CHARS = 2000
+MAX_TRACEBACK_CHARS = 3000
+
+
 class GitHubIssueReporter:
     """Auto-report module failures to GitHub Issues via a GitHub App."""
 
@@ -41,14 +54,18 @@ class GitHubIssueReporter:
         self.repo_owner: str = os.getenv("GITHUB_REPO_OWNER", "SIN-CLIs")
         self.repo_name: str = os.getenv("GITHUB_REPO_NAME", "playstealth-cli")
 
+        # Token cache. ``_token`` is the canonical slot used by
+        # ``_get_installation_token``; ``_token_cache`` is exposed as a
+        # documented alias so external test fixtures can prime it.
         self._token: Optional[str] = None
+        self._token_cache: Optional[str] = None
         self._token_expires: float = 0.0
 
-        # Public alias kept for the existing wrapper code.
-        self._reported_hashes: Set[str] = set()
-        # Alias used by the new test-suite.
-        self._issue_hashes: Set[str] = self._reported_hashes
-        self._token_cache: Optional[str] = None  # documented attribute
+        # ``_issue_hashes`` is the public dedup set used by tests; the
+        # legacy code referenced ``_reported_hashes`` - keep both names
+        # pointing at the same set so existing call-sites keep working.
+        self._issue_hashes: Set[str] = set()
+        self._reported_hashes: Set[str] = self._issue_hashes
 
         self._enabled: bool = bool(
             self.app_id
@@ -80,8 +97,11 @@ class GitHubIssueReporter:
 
     async def _get_installation_token(self) -> Optional[str]:
         """Return a cached installation access token, refreshing as needed."""
-        if self._token and time.time() < self._token_expires:
-            return self._token
+        # Prefer the explicit cache slot, fall back to the alias for tests
+        # that prime ``_token_cache`` directly.
+        cached = self._token or self._token_cache
+        if cached and time.time() < self._token_expires:
+            return cached
 
         try:
             import httpx  # local import keeps cold-start light
@@ -100,11 +120,11 @@ class GitHubIssueReporter:
                 if res.status_code == 201:
                     data = res.json()
                     self._token = data["token"]
+                    self._token_cache = self._token
                     # Tokens last 1h; refresh ~10 min early.
                     self._token_expires = time.time() + 3000
-                    self._token_cache = self._token
                     return self._token
-                # surface the failure for callers / logging
+                # Surface the failure for callers / logging.
                 print(
                     f"github_issue_reporter: token request failed "
                     f"({res.status_code}): {res.text[:200]}"
@@ -118,67 +138,54 @@ class GitHubIssueReporter:
     # Body / dedup helpers
     # ------------------------------------------------------------------
     def _dedup_hash(self, module: str, error: str) -> str:
+        """Stable per-day hash for issue deduplication."""
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return hashlib.sha256(
             f"{module}:{error}:{day}".encode()
         ).hexdigest()[:12]
 
-    def _get_template_type(self, module_name: str, error_msg: str) -> str:
-        ctx = f"{module_name} {error_msg}".lower()
-        keywords = (
-            "selector",
-            "dom",
-            "scan",
-            "click",
-            "resolve",
-            "locator",
-            "timeout",
-            "visible",
-        )
-        if any(kw in ctx for kw in keywords):
-            return "selector_update"
-        return "bug_report"
+    def _build_title(self, module_name: str, error_msg: str, severity: str) -> str:
+        # Headline icon + uppercase severity + module path + truncated error.
+        return (
+            f"\U0001F6A8 {severity.upper()}: [{module_name}] "
+            f"{error_msg[:80]}"
+        ).rstrip()
 
-    def _format_body(
+    def _build_body(
         self,
-        template: str,
+        *,
         module_name: str,
         error_msg: str,
-        tb: str,
-        sid: str,
+        traceback_str: str,
+        session_id: str,
+        severity: str,
         critical: bool,
     ) -> str:
-        base = (
-            f"### Module: `{module_name}`\n"
-            f"**Error:** `{error_msg}`\n"
-            f"**Session:** `{sid}`\n"
-            f"**Critical:** `{'Yes' if critical else 'No'}`\n"
-            f"**Timestamp:** `{datetime.now(timezone.utc).isoformat()}Z`\n\n"
-            "### Traceback\n"
-            "```python\n"
-            f"{tb[:1200]}\n"
+        # Apply hard caps before rendering.
+        error_clipped = error_msg[:MAX_ERROR_CHARS]
+        if len(error_msg) > MAX_ERROR_CHARS:
+            error_clipped += "\n... (truncated)"
+        tb_clipped = traceback_str[:MAX_TRACEBACK_CHARS]
+        if len(traceback_str) > MAX_TRACEBACK_CHARS:
+            tb_clipped += "\n... (truncated)"
+
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        return (
+            f"{META_SECTION}\n"
+            f"- **Module:** `{module_name}`\n"
+            f"- **Session:** `{session_id}`\n"
+            f"- **Severity:** `{severity}`\n"
+            f"- **Critical:** `{'yes' if critical else 'no'}`\n"
+            f"- **Timestamp:** `{ts}`\n\n"
+            f"{ERROR_SECTION}\n"
             "```\n"
-        )
-        if template == "selector_update":
-            return base + (
-                "\n### Selector / DOM context\n"
-                "- [ ] Verify the target platform's DOM has not changed\n"
-                "- [ ] Validate CSS / XPath / text heuristics with "
-                "`playstealth profile <url>`\n"
-                "- [ ] Adjust fallback selectors in `smart_selector.py` or "
-                "the relevant plugin\n"
-                "- [ ] Consider `playstealth queue blacklist-add` for a "
-                "persistent platform change\n\n"
-                "> Auto-reported by the PlayStealth Resilience Engine. "
-                "Fallback applied. Telemetry logged.\n"
-            )
-        return base + (
-            "\n### Bug context\n"
-            "- [ ] Check network / proxy state and Playwright binary version\n"
-            "- [ ] Validate `.env` secrets and GitHub App permissions\n"
-            "- [ ] Inspect `telemetry.jsonl` for preceding module failures\n"
-            "- [ ] On state / resume errors: clean `.playstealth_state/` "
-            "and restart\n\n"
+            f"{error_clipped}\n"
+            "```\n\n"
+            f"{TRACEBACK_SECTION}\n"
+            "```python\n"
+            f"{tb_clipped}\n"
+            "```\n\n"
             "> Auto-reported by the PlayStealth Resilience Engine. "
             "Fallback applied. Telemetry logged.\n"
         )
@@ -204,31 +211,37 @@ class GitHubIssueReporter:
         if not self._enabled:
             return None
 
+        if critical and severity == "high":
+            # Critical failures escalate the severity label automatically.
+            severity = "critical"
+
         h = self._dedup_hash(module_name, error_msg)
-        if not no_dedup and h in self._reported_hashes:
+        if not no_dedup and h in self._issue_hashes:
             return None
-        self._reported_hashes.add(h)
+        # Track the hash up front so concurrent reporters dedup correctly.
+        self._issue_hashes.add(h)
 
-        template = self._get_template_type(module_name, error_msg)
-        title = (
-            f"[{module_name.split('.')[-1]}] "
-            f"{template.replace('_', ' ').title()}: {error_msg[:60]}"
+        title = self._build_title(module_name, error_msg, severity)
+        body = self._build_body(
+            module_name=module_name,
+            error_msg=error_msg,
+            traceback_str=traceback_str,
+            session_id=session_id,
+            severity=severity,
+            critical=critical,
         )
-        default_labels = [
+
+        # Default + caller-provided labels, deduplicated while preserving
+        # insertion order.
+        merged_labels: List[str] = []
+        for lbl in (
             "bug",
-            "auto-reported",
-            module_name.split(".")[0],
-            template,
+            "auto-generated",
             f"severity:{severity}",
-        ]
-        if critical:
-            default_labels.append("critical")
-        if labels:
-            default_labels.extend(labels)
-
-        body = self._format_body(
-            template, module_name, error_msg, traceback_str, session_id, critical
-        )
+            *(labels or ()),
+        ):
+            if lbl and lbl not in merged_labels:
+                merged_labels.append(lbl)
 
         try:
             import httpx
@@ -250,7 +263,7 @@ class GitHubIssueReporter:
                     json={
                         "title": title,
                         "body": body,
-                        "labels": default_labels,
+                        "labels": merged_labels,
                     },
                     headers=headers,
                 )
